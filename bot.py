@@ -124,6 +124,20 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Directory not found: `{args}`", parse_mode=ParseMode.MARKDOWN)
 
 
+AVAILABLE_MODELS = [
+    ("gpt-5.4", "Flagship. Best intelligence, 1M context. $2.50/$15/MTok"),
+    ("gpt-5.4-mini", "Fast & cheap, 400K context. $0.75/$4.50/MTok"),
+    ("gpt-5.3-codex", "Specialized coding model. Powers GPT-5.4's coding"),
+    ("gpt-5.3-codex-spark", "Near-instant real-time coding. Pro only"),
+    ("gpt-5.2-codex", "Advanced coding. Succeeded by 5.3-codex"),
+    ("gpt-5.2", "Previous general-purpose. Succeeded by 5.4"),
+    ("gpt-5.1-codex-max", "Long-horizon agentic coding"),
+    ("gpt-5.1-codex", "Agentic coding. Succeeded by 5.1-codex-max"),
+    ("gpt-5.1", "Great for coding/agentic. Succeeded by 5.2"),
+    ("o3", "Reasoning model"),
+    ("o4-mini", "Fast reasoning model"),
+]
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -132,10 +146,12 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CODEX_MODEL = context.args[0]
         await update.message.reply_text(f"Model switched to `{CODEX_MODEL}`", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(
-            f"Current model: `{CODEX_MODEL}`\n\nUsage: `/model o3` or `/model o4-mini`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        lines = [f"Current: `{CODEX_MODEL}`\n", "Available models:\n"]
+        for model_id, desc in AVAILABLE_MODELS:
+            marker = " <<" if model_id == CODEX_MODEL else ""
+            lines.append(f"`{model_id}`\n  {desc}{marker}\n")
+        lines.append("Usage: `/model gpt-5.4`")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
