@@ -122,6 +122,13 @@ def _init_db():
             enabled   INTEGER DEFAULT 1,
             PRIMARY KEY (user_id, skill_id)
         );
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id    INTEGER,
+            cwd        TEXT,
+            thread_id  TEXT,
+            updated    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, cwd)
+        );
         CREATE TABLE IF NOT EXISTS custom_skills (
             user_id  INTEGER,
             skill_id TEXT,
@@ -172,6 +179,35 @@ def db_get(chat_id, bot_msg_id) -> Optional[dict]:
         (chat_id, bot_msg_id),
     ).fetchone()
     return {"prompt": r[0], "response": r[1]} if r else None
+
+
+# ── Sessions (conversation context) ───────────────────────────
+
+
+def db_get_session(uid: int, cwd: str) -> Optional[str]:
+    """Get the codex thread_id for a user+cwd pair."""
+    r = db.execute(
+        "SELECT thread_id FROM sessions WHERE user_id=? AND cwd=?", (uid, cwd)
+    ).fetchone()
+    return r[0] if r else None
+
+
+def db_set_session(uid: int, cwd: str, thread_id: str):
+    db.execute(
+        "INSERT INTO sessions(user_id,cwd,thread_id) VALUES(?,?,?) "
+        "ON CONFLICT(user_id,cwd) DO UPDATE SET thread_id=?,updated=CURRENT_TIMESTAMP",
+        (uid, cwd, thread_id, thread_id),
+    )
+    db.commit()
+
+
+def db_clear_session(uid: int, cwd: str = None):
+    """Clear session(s) for a user. If cwd is None, clear all."""
+    if cwd:
+        db.execute("DELETE FROM sessions WHERE user_id=? AND cwd=?", (uid, cwd))
+    else:
+        db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    db.commit()
 
 
 # ── Skills ────────────────────────────────────────────────────
@@ -610,22 +646,42 @@ async def run_codex_streaming(
     uid: int,
     status_msg,
     bot,
-) -> tuple[str, str]:
+    thread_id: str = None,
+    image_path: str = None,
+) -> tuple[str, str, str]:
     """Run codex exec with real-time streaming updates.
 
-    Returns (final_html, raw_text).
+    Returns (final_html, raw_text, thread_id).
+    Uses session resume if thread_id is provided for conversation context.
     """
-    cmd = [
-        "codex", "exec", "--json",
-        "-C", str(cwd),
-        "--skip-git-repo-check",
-        "--dangerously-bypass-approvals-and-sandbox",
-    ]
-    if model:
-        cmd += ["--model", model]
-    cmd.append(prompt)
-
-    log.info(f"Running: codex exec ... '{prompt[:80]}'")
+    if thread_id:
+        # Resume existing conversation
+        cmd = [
+            "codex", "exec", "resume", "--json",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            thread_id,
+        ]
+        if model:
+            cmd += ["--model", model]
+        if image_path:
+            cmd += ["-i", image_path]
+        cmd.append(prompt)
+        log.info(f"Resuming session {thread_id[:12]}... '{prompt[:80]}'")
+    else:
+        # New conversation
+        cmd = [
+            "codex", "exec", "--json",
+            "-C", str(cwd),
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+        if model:
+            cmd += ["--model", model]
+        if image_path:
+            cmd += ["-i", image_path]
+        cmd.append(prompt)
+        log.info(f"New session: codex exec ... '{prompt[:80]}'")
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -637,7 +693,7 @@ async def run_codex_streaming(
     except FileNotFoundError:
         msg = "❌ <code>codex</code> CLI not found. Is it installed?"
         await safe_edit(status_msg, msg)
-        return msg, "codex CLI not found"
+        return msg, "codex CLI not found", ""
 
     _active_procs[uid] = proc
 
@@ -647,6 +703,7 @@ async def run_codex_streaming(
     current_action = ""
     last_edit = 0.0
     prev_html = ""
+    result_thread_id = thread_id or ""
 
     try:
         async for raw_line in proc.stdout:
@@ -662,6 +719,13 @@ async def run_codex_streaming(
             item = event.get("item", {}) if isinstance(event.get("item"), dict) else {}
             itype = item.get("type", "")
             changed = False
+
+            # Capture thread_id for session persistence
+            if etype == "thread.started":
+                tid = event.get("thread_id", "")
+                if tid:
+                    result_thread_id = tid
+                continue
 
             if etype == "item.started" and itype == "command_execution":
                 current_action = f"Running: {strip_shell_wrapper(item.get('command', ''))[:100]}"
@@ -732,7 +796,7 @@ async def run_codex_streaming(
 
     raw_text = "\n".join(output_parts)
     final_html = format_final(output_parts, tool_calls, errors)
-    return final_html, raw_text
+    return final_html, raw_text, result_thread_id
 
 
 async def run_codex_simple(prompt: str, cwd: Path, model: str) -> str:
@@ -790,17 +854,21 @@ async def _run_and_respond(
     """Run codex, stream into status_msg, finalize with buttons."""
     cwd = get_cwd(uid)
     model = get_model(uid)
+    cwd_str = str(cwd)
 
-    # If an image was provided, add -i flag to prompt
-    actual_prompt = prompt
-    if image_path:
-        actual_prompt = f"-i {image_path} {prompt}"
+    # Look up existing session for conversation context
+    thread_id = db_get_session(uid, cwd_str)
 
     typing_task = asyncio.create_task(typing_loop(chat_id, context.bot))
+    new_thread_id = ""
 
     try:
-        final_html, raw_text = await asyncio.wait_for(
-            run_codex_streaming(actual_prompt, cwd, model, uid, status_msg, context.bot),
+        final_html, raw_text, new_thread_id = await asyncio.wait_for(
+            run_codex_streaming(
+                prompt, cwd, model, uid, status_msg, context.bot,
+                thread_id=thread_id,
+                image_path=image_path,
+            ),
             timeout=CODEX_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -814,6 +882,10 @@ async def _run_and_respond(
         raw_text = str(e)
     finally:
         typing_task.cancel()
+
+    # Save session thread_id for conversation continuity
+    if new_thread_id:
+        db_set_session(uid, cwd_str, new_thread_id)
 
     buttons = build_buttons(raw_text)
 
@@ -896,10 +968,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update.effective_user.id):
+    uid = update.effective_user.id
+    if not allowed(uid):
         return
-    context.user_data.clear()
-    await update.message.reply_text("🆕 Fresh conversation started.")
+    cwd_str = str(get_cwd(uid))
+    db_clear_session(uid, cwd_str)
+    context.user_data.pop("creating_skill", None)
+    await update.message.reply_text(
+        "🆕 Fresh conversation started.\n"
+        "<i>Codex will forget previous context in this project.</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1232,113 +1311,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text(
             "📷 <i>Analyzing image...</i>", parse_mode=ParseMode.HTML
         )
+        await _run_and_respond(
+            caption, uid, update.effective_chat.id, status_msg, context,
+            image_path=temp_path,
+        )
 
-        # Build codex command with -i flag for image
-        cwd = get_cwd(uid)
-        model = get_model(uid)
-        cmd = [
-            "codex", "exec", "--json",
-            "-C", str(cwd),
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-i", temp_path,
-        ]
-        if model:
-            cmd += ["--model", model]
-        cmd.append(caption)
-
-        typing_task = asyncio.create_task(typing_loop(update.effective_chat.id, context.bot))
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
-            )
-            _active_procs[uid] = proc
-
-            output_parts, tool_calls, errors = [], [], []
-            current_action, last_edit, prev_html = "", 0.0, ""
-
-            async for raw_line in proc.stdout:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = event.get("type", "")
-                item = event.get("item", {}) if isinstance(event.get("item"), dict) else {}
-                itype = item.get("type", "")
-                changed = False
-
-                if etype == "item.completed" and itype == "agent_message":
-                    t = item.get("text", "")
-                    if t:
-                        output_parts.append(t)
-                        current_action = ""
-                        changed = True
-                elif etype == "item.completed" and itype == "command_execution":
-                    tool_calls.append(f"$ {strip_shell_wrapper(item.get('command', ''))}")
-                    current_action = ""
-                    changed = True
-                elif etype == "item.started" and itype == "command_execution":
-                    current_action = f"Running: {strip_shell_wrapper(item.get('command', ''))[:100]}"
-                    changed = True
-                elif etype == "error":
-                    msg = event.get("message", "Unknown error")
-                    try:
-                        msg = json.loads(msg).get("error", {}).get("message", msg)
-                    except Exception:
-                        pass
-                    errors.append(msg)
-                    changed = True
-
-                if changed:
-                    now = time.time()
-                    if now - last_edit >= STREAM_INTERVAL:
-                        html_text = format_streaming(output_parts, tool_calls, current_action, errors)
-                        if html_text != prev_html:
-                            await safe_edit(status_msg, html_text, cancel_button())
-                            prev_html = html_text
-                        last_edit = now
-
-            _active_procs.pop(uid, None)
-            await proc.wait()
-
-            raw_text = "\n".join(output_parts)
-            final_html = format_final(output_parts, tool_calls, errors)
-
-        except Exception as e:
-            final_html = f"❌ <b>Error:</b> {esc(str(e))}"
-            raw_text = str(e)
-        finally:
-            typing_task.cancel()
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-
-        buttons = build_buttons(raw_text)
-        if len(final_html) > MAX_TG:
-            try:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=BytesIO(raw_text.encode()),
-                    filename="response.md",
-                    caption="📄 Full response",
-                )
-            except Exception:
-                pass
-            truncated = final_html[: MAX_TG - 60] + "\n\n📄 <i>Full response sent as file.</i>"
-            await safe_edit(status_msg, truncated, buttons)
-        else:
-            await safe_edit(status_msg, final_html, buttons)
-
-        db_save(update.effective_chat.id, status_msg.message_id, uid, caption, raw_text)
+    # Cleanup
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
 
 
 # ── Document Handler ──────────────────────────────────────────
@@ -1498,7 +1480,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model = get_model(uid)
             typing_task = asyncio.create_task(typing_loop(msg.chat_id, context.bot))
             try:
-                final_html, raw_text = await asyncio.wait_for(
+                final_html, raw_text, _ = await asyncio.wait_for(
                     run_codex_streaming(saved["prompt"], cwd, model, uid, msg, context.bot),
                     timeout=CODEX_TIMEOUT,
                 )
