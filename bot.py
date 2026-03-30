@@ -25,7 +25,10 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    KeyboardButton,
     LinkPreviewOptions,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -113,6 +116,20 @@ def _init_db():
             created    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_hist ON history(chat_id, bot_msg_id);
+        CREATE TABLE IF NOT EXISTS skills (
+            user_id   INTEGER,
+            skill_id  TEXT,
+            enabled   INTEGER DEFAULT 1,
+            PRIMARY KEY (user_id, skill_id)
+        );
+        CREATE TABLE IF NOT EXISTS custom_skills (
+            user_id  INTEGER,
+            skill_id TEXT,
+            name     TEXT,
+            icon     TEXT,
+            prompt   TEXT,
+            PRIMARY KEY (user_id, skill_id)
+        );
     """
     )
     conn.commit()
@@ -155,6 +172,197 @@ def db_get(chat_id, bot_msg_id) -> Optional[dict]:
         (chat_id, bot_msg_id),
     ).fetchone()
     return {"prompt": r[0], "response": r[1]} if r else None
+
+
+# ── Skills ────────────────────────────────────────────────────
+
+BUILT_IN_SKILLS = {
+    "review": {
+        "name": "Review",
+        "icon": "🔍",
+        "desc": "Review code changes",
+        "prompt": "Review the recent code changes in this repository. Focus on bugs, security, performance, and readability. Be thorough but concise.",
+    },
+    "test": {
+        "name": "Tests",
+        "icon": "🧪",
+        "desc": "Run and analyze tests",
+        "prompt": "Run the test suite for this project. Report results, analyze any failures, and suggest fixes.",
+    },
+    "git": {
+        "name": "Git Status",
+        "icon": "📊",
+        "desc": "Git overview",
+        "prompt": "Show git status, recent commits (last 5), current branch, and any uncommitted changes. Summarize concisely.",
+    },
+    "deploy": {
+        "name": "Deploy",
+        "icon": "🚀",
+        "desc": "Help deploy project",
+        "prompt": "Help me deploy this project. Check for any issues first, then walk me through the deployment steps.",
+    },
+    "docs": {
+        "name": "Docs",
+        "icon": "📝",
+        "desc": "Generate documentation",
+        "prompt": "Generate or update documentation for this project. Focus on README, API docs, and inline comments.",
+    },
+    "security": {
+        "name": "Security",
+        "icon": "🔐",
+        "desc": "Security audit",
+        "prompt": "Audit this codebase for security vulnerabilities. Check for common issues: injection, auth flaws, exposed secrets, dependency vulns.",
+    },
+    "refactor": {
+        "name": "Refactor",
+        "icon": "🎨",
+        "desc": "Suggest improvements",
+        "prompt": "Analyze this codebase and suggest refactoring improvements. Focus on code quality, DRY principles, and maintainability.",
+    },
+    "explain": {
+        "name": "Explain",
+        "icon": "💬",
+        "desc": "Explain the codebase",
+        "prompt": "Explain how this codebase works at a high level. Describe the architecture, key files, and data flow.",
+    },
+    "debug": {
+        "name": "Debug",
+        "icon": "🐛",
+        "desc": "Debug recent errors",
+        "prompt": "Help me debug the most recent error or issue in this project. Check logs, recent changes, and common failure points.",
+    },
+    "deps": {
+        "name": "Dependencies",
+        "icon": "📦",
+        "desc": "Check dependencies",
+        "prompt": "Check for outdated or vulnerable dependencies in this project. Suggest updates and flag any breaking changes.",
+    },
+    "pr": {
+        "name": "PR Prep",
+        "icon": "✅",
+        "desc": "Prepare pull request",
+        "prompt": "Prepare a pull request: summarize all changes since the base branch, check for issues, and draft a PR description.",
+    },
+    "scaffold": {
+        "name": "Scaffold",
+        "icon": "🏗️",
+        "desc": "Create new components",
+        "prompt": "Help me scaffold a new component or module for this project. Ask me what I need, then generate the boilerplate.",
+    },
+}
+
+# Default skills enabled for new users
+DEFAULT_SKILLS = ["review", "test", "git", "explain", "debug", "pr"]
+
+
+def db_get_enabled_skills(uid: int) -> list[str]:
+    """Get list of enabled skill IDs for a user."""
+    rows = db.execute(
+        "SELECT skill_id FROM skills WHERE user_id=? AND enabled=1", (uid,)
+    ).fetchall()
+    if rows:
+        return [r[0] for r in rows]
+    # First time: enable defaults
+    for sid in DEFAULT_SKILLS:
+        db.execute(
+            "INSERT OR IGNORE INTO skills(user_id,skill_id,enabled) VALUES(?,?,1)",
+            (uid, sid),
+        )
+    db.commit()
+    return list(DEFAULT_SKILLS)
+
+
+def db_toggle_skill(uid: int, skill_id: str) -> bool:
+    """Toggle a skill on/off. Returns new enabled state."""
+    r = db.execute(
+        "SELECT enabled FROM skills WHERE user_id=? AND skill_id=?",
+        (uid, skill_id),
+    ).fetchone()
+    new_state = 0 if (r and r[0]) else 1
+    db.execute(
+        "INSERT INTO skills(user_id,skill_id,enabled) VALUES(?,?,?) "
+        "ON CONFLICT(user_id,skill_id) DO UPDATE SET enabled=?",
+        (uid, skill_id, new_state, new_state),
+    )
+    db.commit()
+    return bool(new_state)
+
+
+def db_get_custom_skills(uid: int) -> dict:
+    """Get user's custom skills."""
+    rows = db.execute(
+        "SELECT skill_id, name, icon, prompt FROM custom_skills WHERE user_id=?",
+        (uid,),
+    ).fetchall()
+    return {
+        r[0]: {"name": r[1], "icon": r[2], "desc": "Custom skill", "prompt": r[3]}
+        for r in rows
+    }
+
+
+def db_save_custom_skill(uid: int, skill_id: str, name: str, icon: str, prompt: str):
+    db.execute(
+        "INSERT OR REPLACE INTO custom_skills(user_id,skill_id,name,icon,prompt) VALUES(?,?,?,?,?)",
+        (uid, skill_id, name, icon, prompt),
+    )
+    # Auto-enable
+    db.execute(
+        "INSERT OR REPLACE INTO skills(user_id,skill_id,enabled) VALUES(?,?,1)",
+        (uid, skill_id),
+    )
+    db.commit()
+
+
+def db_delete_custom_skill(uid: int, skill_id: str):
+    db.execute(
+        "DELETE FROM custom_skills WHERE user_id=? AND skill_id=?", (uid, skill_id)
+    )
+    db.execute(
+        "DELETE FROM skills WHERE user_id=? AND skill_id=?", (uid, skill_id)
+    )
+    db.commit()
+
+
+def get_all_skills(uid: int) -> dict:
+    """Get all skills (built-in + custom) for a user."""
+    skills = dict(BUILT_IN_SKILLS)
+    skills.update(db_get_custom_skills(uid))
+    return skills
+
+
+# ── Reply Keyboard ────────────────────────────────────────────
+
+
+def build_quick_keyboard(uid: int) -> ReplyKeyboardMarkup:
+    """Build the persistent reply keyboard with enabled skills."""
+    enabled = db_get_enabled_skills(uid)
+    all_skills = get_all_skills(uid)
+
+    buttons = []
+    row = []
+    for sid in enabled:
+        skill = all_skills.get(sid)
+        if not skill:
+            continue
+        row.append(KeyboardButton(f"{skill['icon']} {skill['name']}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    # Bottom row: always-available actions
+    buttons.append([
+        KeyboardButton("🛠️ Skills"),
+        KeyboardButton("⚙️ Settings"),
+    ])
+
+    return ReplyKeyboardMarkup(
+        buttons,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Message or tap a skill...",
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -656,37 +864,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     model = get_model(uid) or "<i>default</i>"
     cwd = get_cwd(uid)
+    n_skills = len(db_get_enabled_skills(uid))
 
     text = (
         f"🚀 <b>Codex Bot ready.</b>\n\n"
         f"📁 <code>{esc(str(cwd))}</code>\n"
-        f"🤖 Model: <code>{model}</code>\n\n"
-        f"Send any message to start coding.\n"
-        f"Send 🎤 voice or 📷 photos too.\n\n"
-        f"<b>Commands</b>\n"
-        f"/new — Fresh conversation\n"
-        f"/repo — Pick a project\n"
-        f"/cd &lt;path&gt; — Change directory\n"
-        f"/model — Switch model\n"
-        f"/status — Current settings"
+        f"🤖 Model: <code>{model}</code>\n"
+        f"🛠️ {n_skills} skills active\n\n"
+        f"Send any message, 🎤 voice, or 📷 photos.\n"
+        f"Tap a skill button below for quick actions.\n\n"
+        f"/setup — Guided setup wizard\n"
+        f"/skills — Manage skills\n"
+        f"/repo — Pick project · /model — Switch model"
     )
 
-    markup = None
+    # Show reply keyboard with quick actions
+    kb = build_quick_keyboard(uid)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    # Also show Mini App button if configured
     if WEBAPP_URL:
         from telegram import WebAppInfo
 
-        markup = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🖥️ Open Terminal",
-                        web_app=WebAppInfo(url=f"{WEBAPP_URL}/app/index.html"),
-                    )
-                ]
-            ]
+        await update.message.reply_text(
+            "🖥️ Or open the full terminal:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(
+                    "Open Terminal",
+                    web_app=WebAppInfo(url=f"{WEBAPP_URL}/app/index.html"),
+                )]]
+            ),
         )
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,6 +1018,114 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skill shop: toggle built-in + custom skills."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+    await _show_skill_shop(uid, update.message, context)
+
+
+async def _show_skill_shop(uid: int, target, context, edit: bool = False):
+    """Render the skill shop as a message with toggle buttons."""
+    enabled = set(db_get_enabled_skills(uid))
+    all_skills = get_all_skills(uid)
+    custom_ids = set(db_get_custom_skills(uid).keys())
+
+    rows = []
+    # Built-in skills (2 per row)
+    row = []
+    for sid, skill in BUILT_IN_SKILLS.items():
+        status = "✅" if sid in enabled else "➖"
+        row.append(
+            InlineKeyboardButton(
+                f"{skill['icon']} {skill['name']} {status}",
+                callback_data=f"sk:{sid}",
+            )
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    # Custom skills section
+    if custom_ids:
+        rows.append([InlineKeyboardButton("── Custom Skills ──", callback_data="noop")])
+        for sid in custom_ids:
+            skill = all_skills[sid]
+            status = "✅" if sid in enabled else "➖"
+            rows.append([
+                InlineKeyboardButton(
+                    f"{skill['icon']} {skill['name']} {status}",
+                    callback_data=f"sk:{sid}",
+                ),
+                InlineKeyboardButton("🗑️", callback_data=f"skdel:{sid}"),
+            ])
+
+    # Action buttons
+    rows.append([
+        InlineKeyboardButton("➕ Create Skill", callback_data="sknew"),
+        InlineKeyboardButton("✅ Done", callback_data="skdone"),
+    ])
+
+    text = (
+        "🛠️ <b>Skill Shop</b>\n\n"
+        "Tap to enable/disable skills.\n"
+        "Enabled skills appear as quick-action buttons.\n"
+    )
+
+    markup = InlineKeyboardMarkup(rows)
+    if edit and hasattr(target, "edit_text"):
+        await safe_edit(target, text, markup)
+    else:
+        await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Guided setup wizard — phone-friendly configuration."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    cwd = get_cwd(uid)
+    model = get_model(uid) or "default"
+    n_skills = len(db_get_enabled_skills(uid))
+
+    rows = [
+        [InlineKeyboardButton(f"📁 Project: {Path(str(cwd)).name}", callback_data="setup:repo")],
+        [InlineKeyboardButton(f"🤖 Model: {model}", callback_data="setup:model")],
+        [InlineKeyboardButton(f"🛠️ Skills: {n_skills} active", callback_data="setup:skills")],
+        [InlineKeyboardButton("✅ Done — Show Quick Actions", callback_data="setup:done")],
+    ]
+
+    await update.message.reply_text(
+        "🚀 <b>Setup Wizard</b>\n\n"
+        "Configure your bot from right here.\n"
+        "Tap any option to change it:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cmd_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle the reply keyboard on/off."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    if context.user_data.get("keyboard_hidden"):
+        context.user_data["keyboard_hidden"] = False
+        kb = build_quick_keyboard(uid)
+        await update.message.reply_text("⌨️ Keyboard shown.", reply_markup=kb)
+    else:
+        context.user_data["keyboard_hidden"] = True
+        await update.message.reply_text(
+            "⌨️ Keyboard hidden. Use /kb to bring it back.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
 # ── Message Handler ───────────────────────────────────────────
 
 
@@ -822,6 +1138,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     if not prompt:
         return
+
+    # ── Check for reply keyboard triggers ──
+    # "⚙️ Settings" → show status
+    if prompt == "⚙️ Settings":
+        return await cmd_status(update, context)
+    # "🛠️ Skills" → open skill shop
+    if prompt == "🛠️ Skills":
+        return await cmd_skills(update, context)
+
+    # ── Custom skill creation flow ──
+    creating = context.user_data.get("creating_skill")
+    if creating:
+        step = creating.get("step")
+        if step == "name":
+            creating["name"] = prompt[:50]
+            creating["step"] = "prompt"
+            await update.message.reply_text(
+                f"Got it: <b>{esc(prompt[:50])}</b>\n\n"
+                "Step 2/3: What should this skill do?\n"
+                "<i>Describe the prompt codex will receive.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        elif step == "prompt":
+            creating["prompt"] = prompt
+            creating["step"] = "icon"
+            icons = ["🔧", "⚡", "🎯", "🔮", "📌", "🌟", "💎", "🏷️", "🧩", "🔬", "📐", "🎲"]
+            rows = [
+                [InlineKeyboardButton(ic, callback_data=f"skicon:{ic}") for ic in icons[i : i + 4]]
+                for i in range(0, len(icons), 4)
+            ]
+            await update.message.reply_text(
+                "Step 3/3: Pick an icon:",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+    # Check if this matches a skill button (e.g., "🔍 Review")
+    all_skills = get_all_skills(uid)
+    skill_prompt = None
+    for sid, skill in all_skills.items():
+        trigger = f"{skill['icon']} {skill['name']}"
+        if prompt == trigger:
+            skill_prompt = skill["prompt"]
+            break
+
+    if skill_prompt:
+        prompt = skill_prompt
 
     # Per-user lock to prevent overload
     if uid not in _user_locks:
@@ -1219,6 +1583,166 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Folder not found.")
         return
 
+    # ── Skill toggle
+    if data.startswith("sk:"):
+        skill_id = data[3:]
+        if skill_id in BUILT_IN_SKILLS or skill_id in db_get_custom_skills(uid):
+            new_state = db_toggle_skill(uid, skill_id)
+            skill = get_all_skills(uid).get(skill_id, {})
+            status = "enabled ✅" if new_state else "disabled ➖"
+            await query.answer(f"{skill.get('icon', '')} {skill.get('name', skill_id)} {status}")
+            # Refresh the skill shop
+            await _show_skill_shop(uid, msg, context, edit=True)
+        return
+
+    # ── Delete custom skill
+    if data.startswith("skdel:"):
+        skill_id = data[6:]
+        customs = db_get_custom_skills(uid)
+        if skill_id in customs:
+            db_delete_custom_skill(uid, skill_id)
+            await query.answer(f"Deleted {customs[skill_id]['name']}")
+            await _show_skill_shop(uid, msg, context, edit=True)
+        else:
+            await query.answer("Skill not found.")
+        return
+
+    # ── Create custom skill (start flow)
+    if data == "sknew":
+        await query.answer()
+        context.user_data["creating_skill"] = {"step": "name"}
+        await context.bot.send_message(
+            msg.chat_id,
+            "✨ <b>Create a Custom Skill</b>\n\n"
+            "Step 1/3: What should this skill be called?\n"
+            "<i>Example: Lint Check, API Test, Build</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Skill shop done → show reply keyboard
+    if data == "skdone":
+        await query.answer("Quick actions updated!")
+        kb = build_quick_keyboard(uid)
+        await context.bot.send_message(
+            msg.chat_id,
+            "✅ Skills saved! Your quick actions are ready below.",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Noop (section headers)
+    if data == "noop":
+        await query.answer()
+        return
+
+    # ── Setup wizard callbacks
+    if data == "setup:repo":
+        await query.answer()
+        # Reuse repo command logic
+        projects_dir = BASE_DIR / "Desktop" / "Projects"
+        if not projects_dir.exists():
+            projects_dir = BASE_DIR
+        try:
+            folders = sorted(
+                d.name for d in projects_dir.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            )
+        except PermissionError:
+            await query.answer("Can't read directory.")
+            return
+        folder_map = {}
+        rows = []
+        row = []
+        for f in folders[:20]:
+            h = hashlib.md5(f.encode()).hexdigest()[:8]
+            folder_map[h] = str(projects_dir / f)
+            row.append(InlineKeyboardButton(f"📁 {f}", callback_data=f"cd:{h}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        context.user_data["repo_folders"] = folder_map
+        await context.bot.send_message(
+            msg.chat_id,
+            "📁 <b>Pick a project:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data == "setup:model":
+        await query.answer()
+        current = get_model(uid)
+        rows = []
+        row = []
+        for mid, desc in MODELS:
+            label = f"{'✅ ' if mid == current else ''}{mid}"
+            row.append(InlineKeyboardButton(label, callback_data=f"sm:{mid}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        await context.bot.send_message(
+            msg.chat_id,
+            "🤖 <b>Pick a model:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("sm:"):
+        new_model = data[3:]
+        db_set_user(uid, model=new_model)
+        await query.answer(f"Model → {new_model}")
+        await safe_edit(msg, f"🤖 Model set to <code>{esc(new_model)}</code>")
+        return
+
+    if data == "setup:skills":
+        await query.answer()
+        await _show_skill_shop(uid, msg, context)
+        return
+
+    if data == "setup:done":
+        await query.answer("Setup complete!")
+        kb = build_quick_keyboard(uid)
+        await context.bot.send_message(
+            msg.chat_id,
+            "✅ <b>Setup complete!</b>\n\n"
+            f"📁 {esc(str(get_cwd(uid)))}\n"
+            f"🤖 {esc(get_model(uid) or 'default')}\n"
+            f"🛠️ {len(db_get_enabled_skills(uid))} skills active\n\n"
+            "Your quick actions are ready. Start coding!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+
+    # ── Custom skill icon selection
+    if data.startswith("skicon:"):
+        icon = data[7:]
+        creating = context.user_data.get("creating_skill", {})
+        if creating.get("step") == "icon":
+            creating["icon"] = icon
+            # Save the skill
+            name = creating["name"]
+            prompt = creating["prompt"]
+            skill_id = f"custom_{hashlib.md5(name.encode()).hexdigest()[:8]}"
+            db_save_custom_skill(uid, skill_id, name, icon, prompt)
+            context.user_data.pop("creating_skill", None)
+            await query.answer(f"{icon} {name} created!")
+            kb = build_quick_keyboard(uid)
+            await context.bot.send_message(
+                msg.chat_id,
+                f"✅ Skill <b>{icon} {esc(name)}</b> created and enabled!\n\n"
+                "It's now in your quick actions below.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+        return
+
 
 # ── Inline Mode ───────────────────────────────────────────────
 
@@ -1265,10 +1789,12 @@ async def post_init(app: Application):
     cmds = [
         BotCommand("start", "Initialize bot"),
         BotCommand("new", "Fresh conversation"),
+        BotCommand("setup", "Setup wizard"),
+        BotCommand("skills", "Manage skills"),
         BotCommand("repo", "Pick a project"),
-        BotCommand("cd", "Change directory"),
         BotCommand("model", "Switch model"),
-        BotCommand("status", "Current settings"),
+        BotCommand("status", "Settings"),
+        BotCommand("kb", "Toggle keyboard"),
     ]
     await app.bot.set_my_commands(cmds)
 
@@ -1302,10 +1828,13 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(CommandHandler("repo", cmd_repo))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("kb", cmd_keyboard))
 
     # Content handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
