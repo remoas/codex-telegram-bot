@@ -34,6 +34,8 @@ Edit `.env` and fill in:
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USERS=your_telegram_user_id
 BASE_DIR=/Users/yourname
+CODEX_SANDBOX=danger-full-access
+CODEX_TIMEOUT=3600
 ```
 
 ### 5. Install & run
@@ -59,12 +61,12 @@ That's it. Message your bot on Telegram and start coding.
 | `/start` | Initialize bot |
 | `/new` | Fresh conversation (no context) |
 | `/repo` | List project folders |
-| `/cd <path>` | Change working directory |
+| `/cd <path>` | Change working directory inside `BASE_DIR` |
 | `/model` | List all available models |
 | `/model <name>` | Switch model |
 | `/status` | Current settings |
 
-Or just send any message to start coding.
+Messages in the same directory now keep short conversation history so follow-up prompts work naturally. Use `/new` or `/cd` to reset context.
 
 ## Available Models
 
@@ -123,7 +125,7 @@ The bot will auto-start on boot and restart if it crashes.
 ## Security
 
 - Locked to your Telegram user ID only (`ALLOWED_USERS`)
-- Full filesystem access (configurable via `BASE_DIR`)
+- Working directory changes are restricted to `BASE_DIR`
 - Codex runs with `--full-auto` and configurable sandbox mode
 - No data sent anywhere except Telegram API and OpenAI
 - Bot token stored locally in `.env` (gitignored)

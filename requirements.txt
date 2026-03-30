@@ -1,2 +1,8 @@
 python-telegram-bot>=22.0
 python-dotenv>=1.0
+
+# Optional: voice transcription
+# openai>=1.0
+
+# Optional: Mini App server
+# aiohttp>=3.9
