@@ -1041,11 +1041,25 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    target = Path(args).expanduser().resolve()
-    for base in [None, BASE_DIR, BASE_DIR / "Desktop" / "Projects"]:
-        if base:
-            target = (base / args).resolve()
+    # Try resolving against known bases
+    candidates = [
+        Path(args).expanduser().resolve(),
+        (BASE_DIR / args).resolve(),
+        (BASE_DIR / "Desktop" / "Projects" / args).resolve(),
+    ]
+
+    for target in candidates:
         if target.exists() and target.is_dir():
+            # Security: confirm path is under BASE_DIR (prevent traversal)
+            try:
+                target.resolve().relative_to(BASE_DIR.resolve())
+            except ValueError:
+                await update.message.reply_text(
+                    f"🔒 Access denied: must be within <code>{esc(str(BASE_DIR))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
             db_set_user(uid, cwd=str(target))
             await update.message.reply_text(
                 f"📁 → <code>{esc(str(target))}</code>",

@@ -197,8 +197,12 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             {"error": "Prompt is required"}, status=400
         )
 
-    # Validate cwd
-    cwd_path = Path(cwd)
+    # Validate cwd (must be under BASE_DIR)
+    cwd_path = Path(cwd).resolve()
+    try:
+        cwd_path.relative_to(BASE_DIR.resolve())
+    except ValueError:
+        cwd_path = BASE_DIR
     if not cwd_path.exists() or not cwd_path.is_dir():
         cwd_path = BASE_DIR
 
@@ -214,14 +218,13 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
-    # Build codex command
+    # Build codex command (matches bot.py: fully unrestricted)
     cmd = [
         "codex", "exec",
         "--json",
-        "--sandbox", CODEX_SANDBOX,
         "-C", str(cwd_path),
         "--skip-git-repo-check",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
     ]
     if model:
         cmd += ["--model", model]
