@@ -617,10 +617,9 @@ async def run_codex_streaming(
     """
     cmd = [
         "codex", "exec", "--json",
-        "--sandbox", CODEX_SANDBOX,
         "-C", str(cwd),
         "--skip-git-repo-check",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
     ]
     if model:
         cmd += ["--model", model]
@@ -740,10 +739,9 @@ async def run_codex_simple(prompt: str, cwd: Path, model: str) -> str:
     """Run codex without streaming (for inline mode). Returns raw text."""
     cmd = [
         "codex", "exec", "--json",
-        "--sandbox", CODEX_SANDBOX,
         "-C", str(cwd),
         "--skip-git-repo-check",
-        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
     ]
     if model:
         cmd += ["--model", model]
@@ -1011,7 +1009,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 Model: <code>{esc(get_model(uid) or 'default')}</code>\n"
         f"📁 Dir: <code>{esc(str(get_cwd(uid)))}</code>\n"
-        f"🔒 Sandbox: <code>{esc(CODEX_SANDBOX)}</code>\n"
+        f"🔓 Sandbox: <code>fully unrestricted</code>\n"
         f"🎤 Voice: {'✅' if HAS_OPENAI else '❌ needs OPENAI_API_KEY'}\n"
         f"👤 ID: <code>{uid}</code>",
         parse_mode=ParseMode.HTML,
@@ -1240,10 +1238,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         model = get_model(uid)
         cmd = [
             "codex", "exec", "--json",
-            "--sandbox", CODEX_SANDBOX,
             "-C", str(cwd),
             "--skip-git-repo-check",
-            "--full-auto",
+            "--dangerously-bypass-approvals-and-sandbox",
             "-i", temp_path,
         ]
         if model:
