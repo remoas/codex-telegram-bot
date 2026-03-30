@@ -1104,40 +1104,32 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _show_skill_shop(uid: int, target, context, edit: bool = False):
-    """Render the skill shop as a message with toggle buttons."""
+    """Render the skill shop — tap a skill to see what it does."""
     enabled = set(db_get_enabled_skills(uid))
     all_skills = get_all_skills(uid)
     custom_ids = set(db_get_custom_skills(uid).keys())
 
     rows = []
-    # Built-in skills (2 per row)
-    row = []
+    # Built-in skills (one per row for readability)
     for sid, skill in BUILT_IN_SKILLS.items():
         status = "✅" if sid in enabled else "➖"
-        row.append(
+        rows.append([
             InlineKeyboardButton(
-                f"{skill['icon']} {skill['name']} {status}",
-                callback_data=f"sk:{sid}",
+                f"{status} {skill['icon']} {skill['name']} — {skill['desc']}",
+                callback_data=f"ski:{sid}",
             )
-        )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        ])
 
-    # Custom skills section
+    # Custom skills
     if custom_ids:
-        rows.append([InlineKeyboardButton("── Custom Skills ──", callback_data="noop")])
         for sid in custom_ids:
             skill = all_skills[sid]
             status = "✅" if sid in enabled else "➖"
             rows.append([
                 InlineKeyboardButton(
-                    f"{skill['icon']} {skill['name']} {status}",
-                    callback_data=f"sk:{sid}",
-                ),
-                InlineKeyboardButton("🗑️", callback_data=f"skdel:{sid}"),
+                    f"{status} {skill['icon']} {skill['name']} — {skill['desc']}",
+                    callback_data=f"ski:{sid}",
+                )
             ])
 
     # Action buttons
@@ -1148,8 +1140,8 @@ async def _show_skill_shop(uid: int, target, context, edit: bool = False):
 
     text = (
         "🛠️ <b>Skill Shop</b>\n\n"
-        "Tap to enable/disable skills.\n"
-        "Enabled skills appear as quick-action buttons.\n"
+        "Tap a skill to see details and enable/disable it.\n"
+        "Enabled skills appear as quick-action buttons below your chat.\n"
     )
 
     markup = InlineKeyboardMarkup(rows)
@@ -1157,6 +1149,42 @@ async def _show_skill_shop(uid: int, target, context, edit: bool = False):
         await safe_edit(target, text, markup)
     else:
         await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def _show_skill_detail(uid: int, skill_id: str, msg, context):
+    """Show a skill's detail view with description, prompt preview, and toggle."""
+    all_skills = get_all_skills(uid)
+    skill = all_skills.get(skill_id)
+    if not skill:
+        return
+
+    enabled = skill_id in set(db_get_enabled_skills(uid))
+    is_custom = skill_id in db_get_custom_skills(uid)
+    toggle_label = "❌ Disable" if enabled else "✅ Enable"
+
+    # Truncate prompt preview
+    prompt_preview = skill["prompt"]
+    if len(prompt_preview) > 200:
+        prompt_preview = prompt_preview[:200] + "…"
+
+    text = (
+        f"{skill['icon']} <b>{esc(skill['name'])}</b>\n\n"
+        f"{esc(skill['desc'])}\n\n"
+        f"<b>What it does:</b>\n"
+        f"<blockquote>{esc(prompt_preview)}</blockquote>\n\n"
+        f"Status: {'✅ Enabled' if enabled else '➖ Disabled'}"
+    )
+
+    rows = [
+        [InlineKeyboardButton(toggle_label, callback_data=f"sk:{skill_id}")],
+    ]
+    if is_custom:
+        rows[0].append(
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"skdel:{skill_id}")
+        )
+    rows.append([InlineKeyboardButton("← Back to Skills", callback_data="skback")])
+
+    await safe_edit(msg, text, InlineKeyboardMarkup(rows))
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1562,7 +1590,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Folder not found.")
         return
 
-    # ── Skill toggle
+    # ── Skill detail view (tap to see info)
+    if data.startswith("ski:"):
+        skill_id = data[4:]
+        await query.answer()
+        await _show_skill_detail(uid, skill_id, msg, context)
+        return
+
+    # ── Skill toggle (from detail view)
     if data.startswith("sk:"):
         skill_id = data[3:]
         if skill_id in BUILT_IN_SKILLS or skill_id in db_get_custom_skills(uid):
@@ -1570,8 +1605,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             skill = get_all_skills(uid).get(skill_id, {})
             status = "enabled ✅" if new_state else "disabled ➖"
             await query.answer(f"{skill.get('icon', '')} {skill.get('name', skill_id)} {status}")
-            # Refresh the skill shop
-            await _show_skill_shop(uid, msg, context, edit=True)
+            # Refresh the detail view to show new state
+            await _show_skill_detail(uid, skill_id, msg, context)
+        return
+
+    # ── Back to skill shop from detail view
+    if data == "skback":
+        await query.answer()
+        await _show_skill_shop(uid, msg, context, edit=True)
         return
 
     # ── Delete custom skill
