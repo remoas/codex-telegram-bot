@@ -137,6 +137,14 @@ def _init_db():
             prompt   TEXT,
             PRIMARY KEY (user_id, skill_id)
         );
+        CREATE TABLE IF NOT EXISTS pins (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id  INTEGER,
+            cwd      TEXT,
+            text     TEXT,
+            created  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_pins ON pins(user_id, cwd);
     """
     )
     conn.commit()
@@ -208,6 +216,93 @@ def db_clear_session(uid: int, cwd: str = None):
     else:
         db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
     db.commit()
+
+
+# ── Pins (per-project persistent context) ─────────────────────
+
+
+def db_add_pin(uid: int, cwd: str, text: str) -> int:
+    cur = db.execute(
+        "INSERT INTO pins(user_id,cwd,text) VALUES(?,?,?)", (uid, cwd, text)
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def db_get_pins(uid: int, cwd: str) -> list[tuple[int, str]]:
+    rows = db.execute(
+        "SELECT id, text FROM pins WHERE user_id=? AND cwd=? ORDER BY id",
+        (uid, cwd),
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def db_del_pin(uid: int, pin_id: int):
+    db.execute("DELETE FROM pins WHERE id=? AND user_id=?", (pin_id, uid))
+    db.commit()
+
+
+def build_pin_context(uid: int, cwd: str) -> str:
+    """Build context string from all pins for this project."""
+    pins = db_get_pins(uid, cwd)
+    if not pins:
+        return ""
+    lines = ["[Project context — always follow these instructions:]"]
+    for _, text in pins:
+        lines.append(f"- {text}")
+    return "\n".join(lines) + "\n\n"
+
+
+# ── URL Fetching ──────────────────────────────────────────────
+
+
+async def fetch_url_text(url: str, max_chars: int = 4000) -> str:
+    """Fetch a URL and return plain text content."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "CodexTelegramBot/1.0"})
+        result = await asyncio.to_thread(
+            lambda: urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
+        )
+        # Strip HTML tags for a rough plain text extraction
+        text = re.sub(r"<script[^>]*>.*?</script>", "", result, flags=re.DOTALL)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception as e:
+        return f"[Failed to fetch {url}: {e}]"
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract HTTP(S) URLs from text."""
+    return re.findall(r"https?://[^\s<>\"')\]]+", text)
+
+
+# ── Shell Execution ───────────────────────────────────────────
+
+
+async def run_shell(cmd: str, cwd: Path, timeout: int = 60) -> str:
+    """Run a shell command and return output."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(cwd),
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        output = stdout.decode("utf-8", errors="replace").strip()
+        code = proc.returncode
+        return f"{output}\n\n[exit {code}]" if output else f"[exit {code}]"
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "[timed out]"
+    except Exception as e:
+        return f"[error: {e}]"
 
 
 # ── Skills ────────────────────────────────────────────────────
@@ -856,6 +951,22 @@ async def _run_and_respond(
     model = get_model(uid)
     cwd_str = str(cwd)
 
+    # Prepend pinned context for this project
+    pin_ctx = build_pin_context(uid, cwd_str)
+    if pin_ctx:
+        prompt = pin_ctx + prompt
+
+    # Fetch any URLs in the message and include as context
+    urls = extract_urls(prompt)
+    if urls:
+        url_parts = []
+        for url in urls[:3]:  # Max 3 URLs
+            content = await fetch_url_text(url)
+            if content and not content.startswith("[Failed"):
+                url_parts.append(f"[Content from {url}:]\n{content}\n")
+        if url_parts:
+            prompt = "\n".join(url_parts) + "\n" + prompt
+
     # Look up existing session for conversation context
     thread_id = db_get_session(uid, cwd_str)
 
@@ -1243,6 +1354,247 @@ async def cmd_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⌨️ Keyboard hidden. Use /kb to bring it back.",
             reply_markup=ReplyKeyboardRemove(),
         )
+
+
+# ── Pin Commands ──────────────────────────────────────────────
+
+
+async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pin persistent context for the current project."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text(
+            "📌 Usage: <code>/pin Always use TypeScript strict mode</code>\n\n"
+            "Pinned instructions are sent to codex with every message in this project.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    cwd_str = str(get_cwd(uid))
+    pin_id = db_add_pin(uid, cwd_str, text)
+    count = len(db_get_pins(uid, cwd_str))
+    await update.message.reply_text(
+        f"📌 Pinned (#{pin_id}):\n<i>{esc(text)}</i>\n\n"
+        f"{count} pin{'s' if count != 1 else ''} active for this project.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_pins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all pins for the current project."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    cwd_str = str(get_cwd(uid))
+    pins = db_get_pins(uid, cwd_str)
+    if not pins:
+        await update.message.reply_text(
+            "📌 No pins for this project.\n"
+            "Use <code>/pin your instruction here</code> to add one.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"📌 <b>Pins for</b> <code>{esc(Path(cwd_str).name)}</code>\n"]
+    for pin_id, text in pins:
+        lines.append(f"  #{pin_id}: <i>{esc(text)}</i>")
+    lines.append(f"\nRemove with <code>/unpin #</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a pin by ID."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/unpin 3</code>", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        pin_id = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("❌ Pin ID must be a number.")
+        return
+
+    db_del_pin(uid, pin_id)
+    await update.message.reply_text(f"📌 Pin #{pin_id} removed.")
+
+
+# ── Run Command (direct shell) ────────────────────────────────
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Execute a shell command directly without codex."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    cmd_text = " ".join(context.args) if context.args else ""
+    if not cmd_text:
+        await update.message.reply_text(
+            "⚡ Usage: <code>/run npm test</code>\n\n"
+            "Runs the command directly in your project directory. No AI involved.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    cwd = get_cwd(uid)
+    status_msg = await update.message.reply_text(
+        f"⚡ <code>$ {esc(cmd_text)}</code>", parse_mode=ParseMode.HTML
+    )
+
+    output = await run_shell(cmd_text, cwd, timeout=120)
+
+    # Format output
+    if len(output) > MAX_TG - 200:
+        # Send as file
+        try:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=BytesIO(output.encode()),
+                filename="output.txt",
+                caption=f"$ {cmd_text}",
+            )
+        except Exception:
+            pass
+        short = output[:500] + "\n…\n" + output[-200:]
+        await safe_edit(status_msg, f"⚡ <code>$ {esc(cmd_text)}</code>\n\n<pre>{esc(short)}</pre>")
+    else:
+        await safe_edit(status_msg, f"⚡ <code>$ {esc(cmd_text)}</code>\n\n<pre>{esc(output)}</pre>")
+
+
+# ── Search History ────────────────────────────────────────────
+
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search conversation history."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text(
+            "🔍 Usage: <code>/search auth bug</code>\n\n"
+            "Searches your conversation history.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Search prompts and responses
+    pattern = f"%{query}%"
+    rows = db.execute(
+        "SELECT prompt, response, created FROM history "
+        "WHERE user_id=? AND (prompt LIKE ? OR response LIKE ?) "
+        "ORDER BY created DESC LIMIT 5",
+        (uid, pattern, pattern),
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text(f"🔍 No results for <i>{esc(query)}</i>", parse_mode=ParseMode.HTML)
+        return
+
+    lines = [f"🔍 <b>Results for</b> <i>{esc(query)}</i>\n"]
+    for prompt, response, created in rows:
+        date = created[:10] if created else "?"
+        prompt_snip = (prompt or "")[:80].replace("\n", " ")
+        resp_snip = (response or "")[:100].replace("\n", " ")
+        lines.append(
+            f"<b>{date}</b> — <code>{esc(prompt_snip)}</code>\n"
+            f"  <i>{esc(resp_snip)}{'…' if len(response or '') > 100 else ''}</i>\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ── Git Workflow Commands ─────────────────────────────────────
+
+
+async def cmd_commit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Git add + commit with AI-generated message."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+
+    cwd = get_cwd(uid)
+
+    # Get diff summary
+    diff = await run_shell("git diff --stat && echo '---' && git diff --staged --stat", cwd)
+    status = await run_shell("git status --short", cwd)
+
+    if not status.strip() or status.strip() == "[exit 0]":
+        await update.message.reply_text("✅ Nothing to commit — working tree clean.")
+        return
+
+    # Ask codex to generate commit message
+    status_msg = await update.message.reply_text("📝 <i>Generating commit message...</i>", parse_mode=ParseMode.HTML)
+
+    msg_override = " ".join(context.args) if context.args else ""
+    if msg_override:
+        commit_msg = msg_override
+    else:
+        # Use codex to generate message
+        prompt = (
+            f"Generate a concise git commit message (1-2 lines) for these changes. "
+            f"Return ONLY the commit message, nothing else.\n\n"
+            f"Status:\n{status}\n\nDiff:\n{diff[:2000]}"
+        )
+        commit_msg = await run_codex_simple(prompt, cwd, get_model(uid))
+        commit_msg = commit_msg.strip().strip('"').strip("'").strip("`")
+
+    # Stage and commit
+    result = await run_shell(f'git add -A && git commit -m "{commit_msg}"', cwd)
+
+    await safe_edit(
+        status_msg,
+        f"📝 <b>Committed:</b>\n<code>{esc(commit_msg)}</code>\n\n<pre>{esc(result[-500:])}</pre>",
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🚀 Push", callback_data="git:push"),
+                InlineKeyboardButton("✅ Create PR", callback_data="git:pr"),
+            ]
+        ]),
+    )
+
+
+async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Git push."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+    cwd = get_cwd(uid)
+    result = await run_shell("git push", cwd, timeout=30)
+    await update.message.reply_text(f"🚀 <pre>{esc(result)}</pre>", parse_mode=ParseMode.HTML)
+
+
+async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show git diff."""
+    uid = update.effective_user.id
+    if not allowed(uid):
+        return
+    cwd = get_cwd(uid)
+    diff = await run_shell("git diff", cwd)
+    if not diff.strip() or diff.strip() == "[exit 0]":
+        diff = await run_shell("git diff --staged", cwd)
+    if not diff.strip() or diff.strip() == "[exit 0]":
+        await update.message.reply_text("✅ No changes.")
+        return
+
+    if len(diff) > MAX_TG - 100:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=BytesIO(diff.encode()),
+            filename="changes.diff",
+            caption="📋 Git diff",
+        )
+    else:
+        await update.message.reply_text(f"📋 <pre>{esc(diff)}</pre>", parse_mode=ParseMode.HTML)
 
 
 # ── Message Handler ───────────────────────────────────────────
@@ -1754,6 +2106,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Git workflow buttons
+    if data == "git:push":
+        await query.answer("🚀 Pushing...")
+        cwd = get_cwd(uid)
+        result = await run_shell("git push", cwd, timeout=30)
+        await context.bot.send_message(
+            msg.chat_id, f"🚀 <pre>{esc(result)}</pre>", parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "git:pr":
+        await query.answer("✅ Creating PR...")
+        cwd = get_cwd(uid)
+        # Get branch name and generate PR
+        branch = (await run_shell("git branch --show-current", cwd)).split("\n")[0].strip()
+        result = await run_shell(
+            f'gh pr create --fill --head "{branch}" 2>&1 || echo "PR may already exist"',
+            cwd, timeout=30,
+        )
+        await context.bot.send_message(
+            msg.chat_id, f"✅ <pre>{esc(result)}</pre>", parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "git:diff":
+        await query.answer("📋 Fetching diff...")
+        cwd = get_cwd(uid)
+        diff = await run_shell("git diff", cwd)
+        if len(diff) > MAX_TG - 100:
+            await context.bot.send_document(
+                chat_id=msg.chat_id,
+                document=BytesIO(diff.encode()),
+                filename="changes.diff",
+                caption="📋 Git diff",
+            )
+        else:
+            await context.bot.send_message(
+                msg.chat_id, f"📋 <pre>{esc(diff)}</pre>", parse_mode=ParseMode.HTML
+            )
+        return
+
     # ── Custom skill icon selection
     if data.startswith("skicon:"):
         icon = data[7:]
@@ -1827,8 +2220,12 @@ async def post_init(app: Application):
         BotCommand("skills", "Manage skills"),
         BotCommand("repo", "Pick a project"),
         BotCommand("model", "Switch model"),
-        BotCommand("status", "Settings"),
-        BotCommand("kb", "Toggle keyboard"),
+        BotCommand("run", "Run shell command directly"),
+        BotCommand("pin", "Pin project context"),
+        BotCommand("pins", "View pinned context"),
+        BotCommand("commit", "Git commit with AI message"),
+        BotCommand("diff", "Show git diff"),
+        BotCommand("search", "Search history"),
     ]
     await app.bot.set_my_commands(cmds)
 
@@ -1869,6 +2266,14 @@ def main():
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("kb", cmd_keyboard))
+    app.add_handler(CommandHandler("pin", cmd_pin))
+    app.add_handler(CommandHandler("pins", cmd_pins))
+    app.add_handler(CommandHandler("unpin", cmd_unpin))
+    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("commit", cmd_commit))
+    app.add_handler(CommandHandler("push", cmd_push))
+    app.add_handler(CommandHandler("diff", cmd_diff))
 
     # Content handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
