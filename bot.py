@@ -28,7 +28,7 @@ load_dotenv(Path(__file__).parent / ".env")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USERS = {int(uid.strip()) for uid in os.environ.get("ALLOWED_USERS", "").split(",") if uid.strip()}
 BASE_DIR = Path(os.environ.get("BASE_DIR", str(Path.home())))
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "o3")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
 CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
 MAX_MESSAGE_LENGTH = 4000
 
@@ -177,12 +177,13 @@ async def run_codex(prompt: str, cwd: Path, context: ContextTypes.DEFAULT_TYPE) 
         "codex", "exec",
         "--json",
         "--sandbox", CODEX_SANDBOX,
-        "--model", CODEX_MODEL,
         "-C", str(cwd),
         "--skip-git-repo-check",
         "--full-auto",
-        prompt,
     ]
+    if CODEX_MODEL:
+        cmd += ["--model", CODEX_MODEL]
+    cmd.append(prompt)
 
     log.info(f"Running: {' '.join(cmd[:6])}... '{prompt[:80]}'")
 
@@ -198,6 +199,7 @@ async def run_codex(prompt: str, cwd: Path, context: ContextTypes.DEFAULT_TYPE) 
 
     output_parts = []
     tool_calls = []
+    errors = []
 
     try:
         async for line in proc.stdout:
@@ -210,35 +212,43 @@ async def run_codex(prompt: str, cwd: Path, context: ContextTypes.DEFAULT_TYPE) 
                 continue
 
             event_type = event.get("type", "")
+            item = event.get("item", {})
+            item_type = item.get("type", "") if isinstance(item, dict) else ""
 
-            if event_type == "message" and event.get("role") == "assistant":
-                content = event.get("content", [])
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            output_parts.append(block["text"])
-                        elif block.get("type") == "tool_use":
-                            tool_name = block.get("name", "tool")
-                            tool_input = block.get("input", {})
-                            if isinstance(tool_input, dict):
-                                # Show what codex is doing
-                                if tool_name == "shell" or tool_name == "bash":
-                                    cmd_str = tool_input.get("command", tool_input.get("cmd", ""))
-                                    tool_calls.append(f"$ {cmd_str}")
-                                elif tool_name in ("write_file", "create_file"):
-                                    tool_calls.append(f"write: {tool_input.get('path', '?')}")
-                                elif tool_name in ("read_file",):
-                                    tool_calls.append(f"read: {tool_input.get('path', '?')}")
-                                elif tool_name in ("edit_file", "apply_diff"):
-                                    tool_calls.append(f"edit: {tool_input.get('path', '?')}")
-                                else:
-                                    tool_calls.append(f"{tool_name}")
-                    elif isinstance(block, str):
-                        output_parts.append(block)
+            # Codex JSONL format: item.completed events with item.type
+            if event_type == "item.completed":
+                if item_type == "agent_message":
+                    text = item.get("text", "")
+                    if text:
+                        output_parts.append(text)
 
-            elif event_type == "message" and event.get("role") == "tool":
-                # Tool results - skip verbose output
-                pass
+                elif item_type == "command_execution":
+                    cmd_str = item.get("command", "")
+                    # Strip shell wrapper (e.g. "/bin/zsh -lc 'actual command'")
+                    if " -lc " in cmd_str:
+                        cmd_str = cmd_str.split(" -lc ", 1)[1].strip("'\"")
+                    tool_calls.append(f"$ {cmd_str}")
+
+            elif event_type == "error":
+                msg = event.get("message", "Unknown error")
+                # Try to parse nested JSON error
+                try:
+                    parsed = json.loads(msg)
+                    msg = parsed.get("error", {}).get("message", msg)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                errors.append(msg)
+
+            elif event_type == "turn.failed":
+                err = event.get("error", {})
+                msg = err.get("message", "Turn failed") if isinstance(err, dict) else str(err)
+                try:
+                    parsed = json.loads(msg)
+                    msg = parsed.get("error", {}).get("message", msg)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                if msg not in errors:
+                    errors.append(msg)
 
     except Exception as e:
         output_parts.append(f"\n[Error reading output: {e}]")
@@ -247,18 +257,20 @@ async def run_codex(prompt: str, cwd: Path, context: ContextTypes.DEFAULT_TYPE) 
 
     # Build response
     response = ""
+    if errors:
+        response += "**Error:**\n" + "\n".join(errors) + "\n\n"
     if tool_calls:
         response += "**Actions taken:**\n" + "\n".join(f"`{t}`" for t in tool_calls[-20:]) + "\n\n"
     if output_parts:
         response += "\n".join(output_parts)
-    else:
+    elif not errors:
         # Check stderr
         stderr = await proc.stderr.read()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if stderr_text:
-            response = f"Codex finished but no text output.\n\nStderr:\n```\n{stderr_text[:2000]}\n```"
+            response += f"Codex finished but no text output.\n\nStderr:\n```\n{stderr_text[:2000]}\n```"
         else:
-            response = "Codex finished with no output."
+            response += "Codex finished with no output."
 
     return response.strip()
 
